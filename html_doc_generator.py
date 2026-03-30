@@ -142,6 +142,10 @@ def _normalize_doc_text(text: str) -> str:
 class HtmlDocGenerator:
     """Generates HTML and DOCX for transcript and explanation (RAG-friendly)."""
 
+    # Step 2.5 digital diagrams: fixed max display (non-dynamic). Hand-drawn uses OpenCV sizing.
+    DIGITAL_HTML_MAX_PCT = 100
+    DIGITAL_DOC_MAX_IN = 6.5  # ≈ full text column on Letter with 1" margins
+
     def __init__(self):
         self.enhanced_subdir = ENHANCED_IMAGES_SUBDIR
 
@@ -325,7 +329,7 @@ class HtmlDocGenerator:
                 if self._is_step3_dynamic_eligible(diagram_to_insert["metadata"]):
                     html_w, _ = self._dynamic_image_widths(diagram_to_insert["path"])
                 else:
-                    html_w = 50
+                    html_w = self.DIGITAL_HTML_MAX_PCT
                 parts.append(
                     f"<figure><img src=\"{html_lib.escape(rel_path)}\" "
                     f"style=\"max-width: {html_w}%; height: auto;\" "
@@ -342,7 +346,7 @@ class HtmlDocGenerator:
                 if self._is_step3_dynamic_eligible(di["metadata"]):
                     html_w, _ = self._dynamic_image_widths(di["path"])
                 else:
-                    html_w = 50
+                    html_w = self.DIGITAL_HTML_MAX_PCT
                 parts.append("<section class=\"segment\">")
                 parts.append(f"<span class=\"timestamp\">[{cap_ts}]</span> ")
                 parts.append(
@@ -435,7 +439,7 @@ class HtmlDocGenerator:
                         if self._is_step3_dynamic_eligible(entry.get("metadata")):
                             html_w, _ = self._dynamic_image_widths(os.path.join(output_dir, path))
                         else:
-                            html_w = 50
+                            html_w = self.DIGITAL_HTML_MAX_PCT
                         out.append(
                             f"<figure><img src=\"{html_lib.escape(path)}\" "
                             f"style=\"max-width: {html_w}%; height: auto;\" "
@@ -563,7 +567,7 @@ window.addEventListener('load', function() {
                     if self._is_step3_dynamic_eligible(diagram_to_insert["metadata"]):
                         _, doc_w = self._dynamic_image_widths(diagram_to_insert["path"])
                     else:
-                        doc_w = 5.0
+                        doc_w = self.DIGITAL_DOC_MAX_IN
                     doc.add_picture(diagram_to_insert["path"], width=Inches(doc_w))
                     cap_ts = format_timestamp(diagram_to_insert["metadata"].get("timestamp", 0))
                     doc.add_paragraph(f"Figure at {cap_ts}", style="Caption")
@@ -579,7 +583,7 @@ window.addEventListener('load', function() {
                         if self._is_step3_dynamic_eligible(di["metadata"]):
                             _, doc_w = self._dynamic_image_widths(di["path"])
                         else:
-                            doc_w = 5.0
+                            doc_w = self.DIGITAL_DOC_MAX_IN
                         doc.add_picture(di["path"], width=Inches(doc_w))
                         doc.add_paragraph(f"Figure at {format_timestamp(di['metadata'].get('timestamp', 0))}", style="Caption")
                     except Exception:
@@ -690,7 +694,7 @@ window.addEventListener('load', function() {
                         if self._is_step3_dynamic_eligible(entry.get("metadata")):
                             _, doc_w = self._dynamic_image_widths(path)
                         else:
-                            doc_w = 5.0
+                            doc_w = self.DIGITAL_DOC_MAX_IN
                         doc.add_picture(path, width=Inches(doc_w))
                         doc.add_paragraph(f"Figure {n}", style="Caption")
                 except ValueError:
