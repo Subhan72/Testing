@@ -1,0 +1,213 @@
+{
+  "name": "Video to PDF Pipeline (Async – ngrok / Cloudflare)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "youtube-to-pdf",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-node-id",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "youtube-to-pdf-trigger"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "extract-url",
+              "name": "video_url",
+              "value": "={{ $json.body?.video_url ?? $json.body?.youtube_url ?? $json.body?.drive_url ?? $json.query?.video_url ?? $json.query?.youtube_url ?? $json.query?.drive_url ?? $json.body?.url ?? $json.query?.url ?? '' }}",
+              "type": "string"
+            },
+            {
+              "id": "base-url",
+              "name": "base_url",
+              "value": "https://prestricken-eugene-shinily.ngrok-free.dev",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-node-id",
+      "name": "Extract Video URL + Base URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "notes": "Set base_url to your tunnel (ngrok/Cloudflare) – no trailing slash. Each request stays under 100s for Cloudflare."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.base_url }}/process-youtube/submit",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ngrok-Skip-Browser-Warning",
+              "value": "69420"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_url\": \"{{ $json.video_url }}\"\n}",
+        "options": {
+          "timeout": 15000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "submit-node-id",
+      "name": "Submit Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "keep-base-url",
+              "name": "base_url",
+              "value": "={{ $('Extract Video URL + Base URL').item.json.base_url }}",
+              "type": "string"
+            },
+            {
+              "id": "keep-job-id",
+              "name": "job_id",
+              "value": "={{ $json.job_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-job-id",
+      "name": "Set job_id + base_url",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Poll GET /job/{job_id} every 5s until status is 'done' or 'failed'. Max ~10 min.\nconst item = $input.first().json;\nconst baseUrl = (item.base_url || '').replace(/\\/$/, '');\nconst jobId = item.job_id;\nconst maxAttempts = 120;\nconst delayMs = 5000;\n\nfor (let i = 0; i < maxAttempts; i++) {\n  await new Promise(r => setTimeout(r, delayMs));\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `${baseUrl}/job/${jobId}`,\n    skipSslCertificateValidation: true,\n    timeout: 10000,\n  });\n  if (res.status === 'done') {\n    return [{ json: { base_url: baseUrl, job_id: jobId } }];\n  }\n  if (res.status === 'failed') {\n    throw new Error(res.error || 'Job failed');\n  }\n}\nthrow new Error('Timeout waiting for job (10 min)');"
+      },
+      "id": "code-poll-id",
+      "name": "Poll until done",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.base_url }}/job/{{ $json.job_id }}/result",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ngrok-Skip-Browser-Warning",
+              "value": "69420"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 60000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "get-result-id",
+      "name": "Get PDF result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Disposition",
+                "value": "attachment; filename=\"lecture_report.pdf\""
+              }
+            ]
+          },
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "respond-node-id",
+      "name": "Respond with PDF",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1320, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          { "node": "Extract Video URL + Base URL", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Extract Video URL + Base URL": {
+      "main": [
+        [
+          { "node": "Submit Job", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Submit Job": {
+      "main": [
+        [
+          { "node": "Set job_id + base_url", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Set job_id + base_url": {
+      "main": [
+        [
+          { "node": "Poll until done", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Poll until done": {
+      "main": [
+        [
+          { "node": "Get PDF result", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Get PDF result": {
+      "main": [
+        [
+          { "node": "Respond with PDF", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

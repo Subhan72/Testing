@@ -1,0 +1,102 @@
+{
+  "name": "Video to PDF – Receive callback (PDF when done)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pipeline-done",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-callback",
+      "name": "Webhook (callback)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "pipeline-done",
+      "notes": "FastAPI POSTs here when the pipeline finishes. Body: JSON with job_id, status, error, pdf_transcript_base64, pdf_explanation_base64 (when done)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Callback: job_id, status, error, pdf_transcript_base64, pdf_explanation_base64.\nconst item = $input.first();\nconst j = item.json || {};\nconst body = j.body || j.params || j;\nconst job_id = String(body.job_id ?? j.job_id ?? '');\nconst status = String(body.status ?? j.status ?? 'unknown');\nconst error = String(body.error ?? j.error ?? '');\nconst out = { json: { job_id, status, error } };\nif (body.pdf_transcript_base64 ?? j.pdf_transcript_base64) out.json.pdf_transcript_base64 = body.pdf_transcript_base64 ?? j.pdf_transcript_base64;\nif (body.pdf_explanation_base64 ?? j.pdf_explanation_base64) out.json.pdf_explanation_base64 = body.pdf_explanation_base64 ?? j.pdf_explanation_base64;\nif (item.binary && Object.keys(item.binary).length) out.binary = item.binary;\nreturn [out];"
+      },
+      "id": "normalize-payload",
+      "name": "Normalize payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "notes": "Outputs job_id, status, error, pdf_transcript_base64, pdf_explanation_base64 (when done)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "done",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "done",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-done",
+      "name": "Status is done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decode pdf_transcript_base64 and pdf_explanation_base64 into binary 'transcript' and 'explanation'.\nconst item = $input.first();\nconst json = item.json || {};\nconst bin = {};\nconst add = (key, b64, fileName) => {\n  if (!b64) return;\n  try {\n    const buffer = Buffer.from(b64, 'base64');\n    bin[key] = await this.helpers.prepareBinaryData(buffer, fileName);\n  } catch (e) {\n    bin[key] = { data: b64, mimeType: 'application/pdf', fileName };\n  }\n};\nadd('transcript', json.pdf_transcript_base64, 'lecture_transcript.pdf');\nadd('explanation', json.pdf_explanation_base64, 'lecture_explanation.pdf');\nif (Object.keys(bin).length) return [{ json, binary: bin }];\nreturn [item];"
+      },
+      "id": "decode-pdf",
+      "name": "Decode PDF to binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, -100],
+      "notes": "Outputs binary 'transcript' (lecture_transcript.pdf) and 'explanation' (lecture_explanation.pdf). Use in Drive, Email, etc."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"received\": true, \"job_id\": $json.job_id, \"status\": $json.status, \"error\": $json.error } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-200",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [880, 0],
+      "notes": "Respond 200 so FastAPI does not retry. When status=done, item has binary.transcript and binary.explanation (both PDFs)."
+    }
+  ],
+  "connections": {
+    "Webhook (callback)": {
+      "main": [[{ "node": "Normalize payload", "type": "main", "index": 0 }]]
+    },
+    "Normalize payload": {
+      "main": [[{ "node": "Status is done?", "type": "main", "index": 0 }]]
+    },
+    "Status is done?": {
+      "main": [
+        [{ "node": "Decode PDF to binary", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 OK", "type": "main", "index": 0 }]
+      ]
+    },
+    "Decode PDF to binary": {
+      "main": [[{ "node": "Respond 200 OK", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "1",
+  "meta": { "templateCredsSetupCompleted": true }
+}

@@ -1,0 +1,138 @@
+{
+  "name": "Video to PDF Pipeline (YouTube or Google Drive)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "youtube-to-pdf",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-node-id",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "youtube-to-pdf-trigger"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "extract-url",
+              "name": "video_url",
+              "value": "={{ $json.body?.video_url ?? $json.body?.youtube_url ?? $json.body?.drive_url ?? $json.query?.video_url ?? $json.query?.youtube_url ?? $json.query?.drive_url ?? $json.body?.url ?? $json.query?.url ?? '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-node-id",
+      "name": "Extract Video URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://prestricken-eugene-shinily.ngrok-free.dev/process-youtube",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ngrok-Skip-Browser-Warning",
+              "value": "69420"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_url\": \"{{ $json.video_url }}\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 600000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "http-node-id",
+      "name": "Call Pipeline API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "notes": "If 'connection closed unexpectedly': n8n Cloud often blocks HTTP. Use HTTPS: run ngrok without --scheme=http, set URL to https://YOUR_SUBDOMAIN.ngrok-free.dev/process-youtube, add header Ngrok-Skip-Browser-Warning: 69420, enable Allow Unauthorized Certificates."
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Disposition",
+                "value": "attachment; filename=\"lecture_report.pdf\""
+              }
+            ]
+          },
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "respond-node-id",
+      "name": "Respond with PDF",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Video URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Video URL": {
+      "main": [
+        [
+          {
+            "node": "Call Pipeline API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Pipeline API": {
+      "main": [
+        [
+          {
+            "node": "Respond with PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

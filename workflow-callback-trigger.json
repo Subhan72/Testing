@@ -1,0 +1,119 @@
+{
+  "name": "Video to PDF – Submit (callback; no timeout)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "youtube-to-pdf",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "youtube-to-pdf-trigger"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "video_url",
+              "name": "video_url",
+              "value": "={{ $json.body?.video_url ?? $json.body?.youtube_url ?? $json.body?.drive_url ?? $json.query?.video_url ?? $json.query?.youtube_url ?? $json.query?.drive_url ?? $json.body?.url ?? $json.query?.url ?? '' }}",
+              "type": "string"
+            },
+            {
+              "id": "base_url",
+              "name": "base_url",
+              "value": "https://prestricken-eugene-shinily.ngrok-free.dev",
+              "type": "string"
+            },
+            {
+              "id": "callback_url",
+              "name": "callback_url",
+              "value": "https://YOUR_N8N_INSTANCE.app.n8n.cloud/webhook/pipeline-done",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-fields",
+      "name": "Set video_url, base_url, callback_url",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "notes": "base_url = your tunnel (ngrok/Cloudflare). callback_url = PRODUCTION Webhook URL of the 'Receive callback' workflow: use /webhook/pipeline-done (NOT /webhook-test/...). Activate that workflow first."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.base_url }}/process-youtube/submit",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ngrok-Skip-Browser-Warning",
+              "value": "69420"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_url\": \"{{ $json.video_url }}\",\n  \"callback_url\": \"{{ $json.callback_url }}\"\n}",
+        "options": {
+          "timeout": 15000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "submit-job",
+      "name": "Submit job (with callback)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"job_id\": $json.job_id, \"message\": $json.message, \"download_url\": $('Set video_url, base_url, callback_url').item.json.base_url.replace(/\\/$/, '') + '/job/' + $json.job_id + '/result', \"download_url_transcript\": $('Set video_url, base_url, callback_url').item.json.base_url.replace(/\\/$/, '') + '/job/' + $json.job_id + '/result/transcript', \"download_url_explanation\": $('Set video_url, base_url, callback_url').item.json.base_url.replace(/\\/$/, '') + '/job/' + $json.job_id + '/result/explanation' } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-ok",
+      "name": "Respond with job_id",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 0],
+      "notes": "Returns job_id, message, and download_url. Anyone with download_url can open it in a browser (when the job is done) to download the PDF; no n8n access needed."
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Set video_url, base_url, callback_url",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set video_url, base_url, callback_url": {
+      "main": [
+        [{ "node": "Submit job (with callback)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Submit job (with callback)": {
+      "main": [[{ "node": "Respond with job_id", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "1",
+  "meta": { "templateCredsSetupCompleted": true }
+}
