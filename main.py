@@ -301,7 +301,15 @@ def process_video_with_transcription(
     
     if stats['total_diagrams'] == 0:
         print("\nWarning: No diagrams available. Skipping transcription and enhancement.")
-        return None, None
+        return {
+            "transcript_html": None,
+            "explanation_html": None,
+            "transcript_doc": None,
+            "explanation_doc": None,
+            "enhanced_diagrams_dir": getattr(
+                output_manager, "enhanced_diagrams_dir", os.path.join(output_manager.output_dir, "enhanced_diagrams")
+            ),
+        }
     
     # Step 2: Transcription
     transcription_service = None
