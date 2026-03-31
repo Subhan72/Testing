@@ -230,10 +230,11 @@ class TranscriptionService:
         """
         ffmpeg_path = shutil.which('ffmpeg')
         if not ffmpeg_path:
-            raise RuntimeError(
-                "Audio file is too large for a single Whisper request and ffmpeg was not found "
-                "for chunking. Please install ffmpeg or trim the video into smaller parts."
-            )
+            # Railway/container environments may not expose ffmpeg on PATH but MoviePy can
+            # still work via imageio-ffmpeg. Use a robust fallback instead of failing hard.
+            if config.VERBOSE:
+                print("ffmpeg not found on PATH. Falling back to MoviePy-based chunking...")
+            return self._transcribe_with_whisper_chunks_moviepy(audio_file, language)
         
         # Segment the already-extracted audio file into ~TRANSCRIPTION_CHUNK_SECONDS pieces
         segment_time = getattr(config, "TRANSCRIPTION_CHUNK_SECONDS", 600.0)
@@ -343,6 +344,134 @@ class TranscriptionService:
             print(f"Chunked transcription complete. Duration: {total_duration:.2f}s, segments: {len(all_segments)}")
         
         return self.transcript_data
+
+    def _transcribe_with_whisper_chunks_moviepy(
+        self,
+        audio_file: str,
+        language: Optional[str] = None,
+    ) -> Dict:
+        """
+        Fallback chunked transcription using MoviePy when ffmpeg binary is unavailable on PATH.
+        This keeps Whisper requests under size limits without requiring system ffmpeg detection.
+        """
+        try:
+            from moviepy import AudioFileClip
+        except Exception as e:
+            raise RuntimeError(
+                "Audio is too large for a single Whisper request and chunking fallback is unavailable. "
+                "Install ffmpeg (or ensure MoviePy/audio backend is available), or trim the video."
+            ) from e
+
+        segment_time = float(getattr(config, "TRANSCRIPTION_CHUNK_SECONDS", 600.0) or 600.0)
+        if segment_time <= 1:
+            segment_time = 600.0
+
+        chunk_dir = tempfile.mkdtemp(prefix="whisper_chunks_mp_")
+        all_segments: List[Dict] = []
+        text_parts: List[str] = []
+        language_detected: Optional[str] = None
+
+        try:
+            clip = AudioFileClip(audio_file)
+            total_audio_duration = float(getattr(clip, "duration", 0.0) or 0.0)
+            if total_audio_duration <= 0:
+                raise RuntimeError("Could not determine audio duration for chunking.")
+
+            chunk_count = int(total_audio_duration // segment_time) + (1 if total_audio_duration % segment_time > 0 else 0)
+            if config.VERBOSE:
+                print(f"Chunking audio via MoviePy into {chunk_count} segment(s) of ~{segment_time:.0f}s...")
+
+            for idx in range(chunk_count):
+                start = idx * segment_time
+                end = min((idx + 1) * segment_time, total_audio_duration)
+                if end <= start:
+                    continue
+
+                chunk_path = os.path.join(chunk_dir, f"chunk_{idx:03d}.mp3")
+                subclip = None
+                try:
+                    # MoviePy API compatibility across versions.
+                    if hasattr(clip, "subclipped"):
+                        subclip = clip.subclipped(start, end)
+                    else:
+                        subclip = clip.subclip(start, end)
+                    subclip.write_audiofile(
+                        chunk_path,
+                        codec="mp3",
+                        bitrate="192k",
+                        logger=None,
+                    )
+                finally:
+                    if subclip is not None:
+                        try:
+                            subclip.close()
+                        except Exception:
+                            pass
+
+                if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) <= 0:
+                    raise RuntimeError(f"MoviePy chunking produced empty chunk: {chunk_path}")
+
+                if config.VERBOSE:
+                    print(f"Transcribing chunk {idx + 1}/{chunk_count}: {chunk_path}")
+
+                with open(chunk_path, "rb") as audio:
+                    tr = self.openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio,
+                        response_format="verbose_json",
+                        language=language,
+                        timestamp_granularities=["segment", "word"],
+                    )
+
+                if language_detected is None:
+                    language_detected = getattr(tr, "language", None)
+
+                segments = getattr(tr, "segments", []) or []
+                for seg in segments:
+                    base_start = getattr(seg, "start", 0.0) or 0.0
+                    base_end = getattr(seg, "end", 0.0) or 0.0
+                    seg_dict = {
+                        "id": getattr(seg, "id", len(all_segments)),
+                        "start": base_start + start,
+                        "end": base_end + start,
+                        "text": getattr(seg, "text", ""),
+                        "words": [],
+                    }
+                    words = getattr(seg, "words", None) or []
+                    for word in words:
+                        seg_dict["words"].append(
+                            {
+                                "word": getattr(word, "word", ""),
+                                "start": (getattr(word, "start", 0.0) or 0.0) + start,
+                                "end": (getattr(word, "end", 0.0) or 0.0) + start,
+                            }
+                        )
+                    all_segments.append(seg_dict)
+
+                if getattr(tr, "text", None):
+                    text_parts.append(tr.text)
+
+            try:
+                clip.close()
+            except Exception:
+                pass
+
+            self.transcript_data = {
+                "text": " ".join(text_parts).strip(),
+                "language": language_detected or (config.TRANSCRIPTION_LANGUAGE or "en"),
+                "duration": total_audio_duration,
+                "segments": all_segments,
+            }
+
+            if config.VERBOSE:
+                print(
+                    f"Chunked transcription (MoviePy fallback) complete. "
+                    f"Duration: {total_audio_duration:.2f}s, segments: {len(all_segments)}"
+                )
+
+            return self.transcript_data
+        finally:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
     
     def detect_language(self) -> Optional[str]:
         """
