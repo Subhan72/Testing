@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -352,6 +353,42 @@ def _sanitize_error_message(msg: str, max_len: int = 500) -> str:
     return cleaned
 
 
+def _ensure_opencv_compatible_video(video_path: str, output_dir: str) -> str:
+    """
+    Transcode to H.264/AAC MP4 for reliable OpenCV decoding (e.g., AV1 sources on Railway).
+    If transcoding fails or ffmpeg is unavailable, return original path.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return video_path
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return video_path
+
+    out_path = os.path.join(output_dir, "video_opencv.mp4")
+    try:
+        subprocess.run(
+            [
+                ffmpeg_path,
+                "-i", video_path,
+                "-c:v", "libx264",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-y",
+                out_path,
+            ],
+            check=True,
+            timeout=7200,
+            capture_output=True,
+        )
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            if config.VERBOSE:
+                logger.info("Using OpenCV-compatible transcoded video: %s", out_path)
+            return out_path
+    except Exception as e:
+        logger.warning("Video transcode skipped/failed; using original file: %s", _sanitize_error_message(str(e)))
+    return video_path
+
+
 def _run_pipeline(video_path: str, output_dir: str, video_title: Optional[str] = None) -> dict:
     """Run full pipeline; returns dict with transcript_html, explanation_html, transcript_doc, explanation_doc, enhanced_diagrams_dir. Raises on failure."""
     try:
@@ -360,8 +397,9 @@ def _run_pipeline(video_path: str, output_dir: str, video_title: Optional[str] =
         raise RuntimeError(f"Pipeline module unavailable: {_sanitize_error_message(str(e))}") from e
 
     try:
+        video_for_pipeline = _ensure_opencv_compatible_video(video_path, output_dir)
         result = process_video_with_transcription(
-            video_path,
+            video_for_pipeline,
             output_dir=output_dir,
             enable_transcription=True,
             enable_enhancement=True,
@@ -370,6 +408,12 @@ def _run_pipeline(video_path: str, output_dir: str, video_title: Optional[str] =
             skip_diagram_extraction=False,
             video_title=video_title,
         )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "Pipeline returned unexpected result type. "
+                "Expected dict with output paths; got "
+                f"{type(result).__name__}."
+            )
         return result
     except Exception as e:
         logger.exception("Pipeline failed for %s", video_path)
