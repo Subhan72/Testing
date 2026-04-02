@@ -8,6 +8,7 @@ Supports:
 - Async callback: POST /process-youtube/submit with callback_url → FastAPI POSTs result to that URL when done (no n8n timeout).
 """
 import logging
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import urllib.request
 import ssl
@@ -24,6 +26,7 @@ from io import BytesIO
 from typing import Any, Optional
 
 import requests
+import redis
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -49,6 +52,12 @@ logger = logging.getLogger("lecture-pipeline")
 # ---------------------------------------------------------------------------
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+_JOBS_STATE_FILE = os.getenv("JOBS_STATE_FILE", "/tmp/lecture_pipeline_jobs.json")
+_REDIS_URL = os.getenv("REDIS_URL", "").strip()
+_JOBS_REDIS_KEY = os.getenv("JOBS_REDIS_KEY", "lecture_pipeline:jobs")
+_redis_client: Optional[redis.Redis] = None
+_MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
+_job_semaphore = threading.Semaphore(max(_MAX_CONCURRENT_JOBS, 1))
 
 JOB_STATUS_PENDING = "pending"
 JOB_STATUS_RUNNING = "running"
@@ -269,6 +278,11 @@ def _download_onedrive_sharepoint_video(
 async def lifespan(app: FastAPI):
     """Load env and ensure temp directory exists. Do not crash on startup errors."""
     try:
+        _init_redis_jobs_backend()
+        if _redis_client is not None:
+            _load_jobs_from_redis()
+        else:
+            _load_jobs_from_disk()
         logger.info("Pipeline API starting")
     except Exception as e:
         logger.exception("Startup warning: %s", e)
@@ -351,6 +365,127 @@ def _sanitize_error_message(msg: str, max_len: int = 500) -> str:
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 3] + "..."
     return cleaned
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _persist_jobs_locked() -> None:
+    """
+    Persist in-memory jobs to Redis (preferred) or disk fallback.
+    Caller must hold _jobs_lock.
+    """
+    if _redis_client is not None:
+        try:
+            pipe = _redis_client.pipeline()
+            pipe.delete(_JOBS_REDIS_KEY)
+            if _jobs:
+                payload = {jid: json.dumps(job, ensure_ascii=False) for jid, job in _jobs.items()}
+                pipe.hset(_JOBS_REDIS_KEY, mapping=payload)
+            pipe.execute()
+            return
+        except Exception as e:
+            logger.warning("Failed to persist jobs to Redis; falling back to disk: %s", _sanitize_error_message(str(e)))
+
+    try:
+        parent = os.path.dirname(_JOBS_STATE_FILE) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = _JOBS_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_jobs, f, ensure_ascii=False)
+        os.replace(tmp, _JOBS_STATE_FILE)
+    except Exception as e:
+        logger.warning("Failed to persist jobs store: %s", _sanitize_error_message(str(e)))
+
+
+def _load_jobs_from_disk() -> None:
+    """Restore jobs snapshot from disk on startup (best-effort)."""
+    if not os.path.isfile(_JOBS_STATE_FILE):
+        return
+    try:
+        with open(_JOBS_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _jobs_lock:
+                _jobs.clear()
+                _jobs.update(data)
+            logger.info("Restored %d jobs from snapshot.", len(data))
+    except Exception as e:
+        logger.warning("Failed to load jobs snapshot: %s", _sanitize_error_message(str(e)))
+
+
+def _init_redis_jobs_backend() -> None:
+    """Initialize Redis backend for _jobs if REDIS_URL is configured."""
+    global _redis_client
+    if not _REDIS_URL:
+        return
+    try:
+        client = redis.Redis.from_url(_REDIS_URL, decode_responses=True)
+        client.ping()
+        _redis_client = client
+        logger.info("Redis jobs backend enabled.")
+    except Exception as e:
+        _redis_client = None
+        logger.warning("Redis jobs backend unavailable, using local fallback: %s", _sanitize_error_message(str(e)))
+
+
+def _load_jobs_from_redis() -> None:
+    """Load jobs snapshot from Redis if available."""
+    if _redis_client is None:
+        return
+    try:
+        raw = _redis_client.hgetall(_JOBS_REDIS_KEY) or {}
+        restored: dict[str, dict[str, Any]] = {}
+        for jid, payload in raw.items():
+            try:
+                job = json.loads(payload)
+                if isinstance(job, dict):
+                    restored[jid] = job
+            except Exception:
+                continue
+        with _jobs_lock:
+            _jobs.clear()
+            _jobs.update(restored)
+        logger.info("Restored %d jobs from Redis.", len(restored))
+    except Exception as e:
+        logger.warning("Failed to load jobs from Redis: %s", _sanitize_error_message(str(e)))
+
+
+_STAGE_PROGRESS = {
+    "queued": 0,
+    "download": 10,
+    "pipeline": 55,
+    "upload": 85,
+    "notify": 95,
+    "done": 100,
+}
+
+
+def _set_job_stage(job_id: str, stage: str, status: Optional[str] = None) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["current_stage"] = stage
+        job["progress_pct"] = _STAGE_PROGRESS.get(stage, job.get("progress_pct", 0))
+        job["updated_at"] = _now_ts()
+        if status:
+            job["status"] = status
+        _persist_jobs_locked()
+
+
+def _fail_job(job_id: str, message: str, failed_stage: str) -> None:
+    err = _sanitize_error_message(message)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = JOB_STATUS_FAILED
+        job["error"] = err
+        job["failed_stage"] = failed_stage
+        job["updated_at"] = _now_ts()
+        _persist_jobs_locked()
 
 
 def _ensure_opencv_compatible_video(video_path: str, output_dir: str) -> str:
@@ -463,13 +598,22 @@ def _send_callback(
 def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None) -> None:
     """Background thread: download video, run pipeline, update job state. Never raises."""
     work_dir = None
+    lock_acquired = False
     try:
+        _job_semaphore.acquire()
+        lock_acquired = True
         work_dir = tempfile.mkdtemp(prefix="pipeline_")
         with _jobs_lock:
             if job_id not in _jobs:
                 return
             _jobs[job_id]["work_dir"] = work_dir
             _jobs[job_id]["status"] = JOB_STATUS_RUNNING
+            _jobs[job_id]["started_at"] = _jobs[job_id].get("started_at") or _now_ts()
+            _jobs[job_id]["updated_at"] = _now_ts()
+            _jobs[job_id]["failed_stage"] = None
+            _jobs[job_id]["error"] = None
+            _persist_jobs_locked()
+        _set_job_stage(job_id, "download", status=JOB_STATUS_RUNNING)
 
         try:
             # Prefer an explicit title from the job record (submitted by frontend)
@@ -510,6 +654,7 @@ def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None)
             if not video_path or not os.path.isfile(video_path):
                 raise RuntimeError("Download did not produce a video file")
 
+            _set_job_stage(job_id, "pipeline")
             pipeline_result = _run_pipeline(video_path, work_dir, video_title=video_title)
             do_upload = False
             pr_for_upload = None
@@ -527,12 +672,17 @@ def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None)
                     _jobs[job_id]["pdf_explanation_path"] = pipeline_result.get("explanation_doc") or pipeline_result.get("explanation_html")
                     do_upload = True
                     pr_for_upload = pipeline_result
+                    _persist_jobs_locked()
                 else:
                     _jobs[job_id]["status"] = JOB_STATUS_FAILED
                     _jobs[job_id]["error"] = "Pipeline did not produce output files"
+                    _jobs[job_id]["failed_stage"] = "pipeline"
+                    _jobs[job_id]["updated_at"] = _now_ts()
+                    _persist_jobs_locked()
             # Upload to SharePoint as soon as the process is finished (outside lock to avoid blocking).
             if do_upload and pr_for_upload:
                 try:
+                    _set_job_stage(job_id, "upload")
                     # Prefer a human-friendly name based on the video title.
                     base_title = (video_title or "lecture_output").strip()
                     base_title = re.sub(r'[<>:"/\\|?*]', "_", base_title)[:200] or "lecture_output"
@@ -543,8 +693,11 @@ def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None)
                         if job_id in _jobs:
                             _jobs[job_id]["sharepoint_url"] = sharepoint_url
                             _jobs[job_id]["video_title"] = video_title
+                            _jobs[job_id]["updated_at"] = _now_ts()
+                            _persist_jobs_locked()
                     logger.info("Job %s: ZIP uploaded to SharePoint (Resources/%s)", job_id, file_name)
                     # Notify the user by email if we have an address.
+                    _set_job_stage(job_id, "notify")
                     if user_email:
                         subject = f"Your lecture processing is complete: {base_title}"
                         body_html = (
@@ -556,21 +709,27 @@ def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None)
                             f"<p>Best regards,<br/>Taraz Lecture Processing System</p>"
                         )
                         _send_completion_email(user_email, subject, body_html)
+                    _set_job_stage(job_id, "done")
+                    with _jobs_lock:
+                        if job_id in _jobs:
+                            _jobs[job_id]["status"] = JOB_STATUS_DONE
+                            _jobs[job_id]["progress_pct"] = 100
+                            _jobs[job_id]["updated_at"] = _now_ts()
+                            _persist_jobs_locked()
                 except Exception as e:
                     logger.exception("SharePoint upload after pipeline failed for job %s: %s", job_id, e)
+                    _fail_job(job_id, str(e), "upload")
         except Exception as e:
             err_msg = _sanitize_error_message(str(e))
             logger.warning("Job %s failed: %s", job_id, err_msg)
+            stage = "download"
             with _jobs_lock:
-                if job_id in _jobs:
-                    _jobs[job_id]["status"] = JOB_STATUS_FAILED
-                    _jobs[job_id]["error"] = err_msg
+                j = _jobs.get(job_id, {})
+                stage = (j.get("current_stage") or "download")
+            _fail_job(job_id, err_msg, stage)
     except Exception as e:
         logger.exception("Job worker crashed for %s: %s", job_id, e)
-        with _jobs_lock:
-            if job_id in _jobs:
-                _jobs[job_id]["status"] = JOB_STATUS_FAILED
-                _jobs[job_id]["error"] = _sanitize_error_message(str(e))
+        _fail_job(job_id, str(e), "worker")
     finally:
         cb_url = None
         with _jobs_lock:
@@ -590,6 +749,8 @@ def _job_worker(job_id: str, video_url: str, callback_url: Optional[str] = None)
                     shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception:
                     pass
+        if lock_acquired:
+            _job_semaphore.release()
 
 
 # ---------------------------------------------------------------------------
@@ -644,13 +805,21 @@ async def submit_job(body: SubmitRequest):
             "callback_url": callback_url,
             "user_email": (body.user_email or "").strip() or None,
             "title": (body.title or "").strip() or None,
+            "current_stage": "queued",
+            "progress_pct": 0,
+            "failed_stage": None,
+            "started_at": _now_ts(),
+            "updated_at": _now_ts(),
         }
+        _persist_jobs_locked()
 
     t = threading.Thread(target=_job_worker, args=(job_id, video_url), kwargs={"callback_url": callback_url}, daemon=True)
     t.start()
 
     out = {
         "job_id": job_id,
+        "status": JOB_STATUS_PENDING,
+        "status_url": f"/job/{job_id}",
         "result_path": f"/job/{job_id}/result",
         "message": None,
     }
@@ -673,9 +842,15 @@ async def job_status(job_id: str):
         "job_id": job_id,
         "status": job["status"],
         "error": job.get("error"),
+        "failed_stage": job.get("failed_stage"),
+        "current_stage": job.get("current_stage"),
+        "progress_pct": job.get("progress_pct", 0),
+        "started_at": job.get("started_at"),
+        "updated_at": job.get("updated_at"),
     }
     if job["status"] == JOB_STATUS_DONE:
         out["result_url"] = f"/job/{job_id}/result"
+        out["sharepoint_url"] = job.get("sharepoint_url")
     return out
 
 
@@ -727,6 +902,9 @@ async def job_result(job_id: str):
             if job_id in _jobs:
                 _jobs[job_id]["status"] = JOB_STATUS_FAILED
                 _jobs[job_id]["error"] = "Output file missing"
+                _jobs[job_id]["failed_stage"] = "result"
+                _jobs[job_id]["updated_at"] = _now_ts()
+                _persist_jobs_locked()
         raise HTTPException(status_code=500, detail="Output file missing")
 
     # Use SharePoint URL from worker upload if present; otherwise upload on demand.
@@ -736,8 +914,14 @@ async def job_result(job_id: str):
             zip_bytes = _make_output_zip(pipeline_result)
             file_name = f"lecture_output_{job_id}.zip"
             sharepoint_url = _upload_zip_to_sharepoint(zip_bytes, file_name)
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["sharepoint_url"] = sharepoint_url
+                    _jobs[job_id]["updated_at"] = _now_ts()
+                    _persist_jobs_locked()
         except Exception as e:
             logger.exception("Job %s result build/upload failed", job_id)
+            _fail_job(job_id, str(e), "result")
             raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
 
     work_dir = job.get("work_dir")
@@ -753,6 +937,7 @@ async def job_result(job_id: str):
         with _jobs_lock:
             if job_id in _jobs:
                 del _jobs[job_id]
+                _persist_jobs_locked()
         if work_dir and os.path.isdir(work_dir):
             try:
                 shutil.rmtree(work_dir, ignore_errors=True)
