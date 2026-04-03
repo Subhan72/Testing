@@ -156,7 +156,8 @@ class HtmlDocGenerator:
         self.enhanced_subdir = ENHANCED_IMAGES_SUBDIR
         self._ai_alt_cache: Dict[str, str] = {}
         self._gemini_client = None
-        self._gemini_model_name = "gemini-3-pro-preview"
+        # Keep model aligned with diagram_enhancer.py for image understanding tasks.
+        self._gemini_model_name = "gemini-3-pro-image-preview"
         if _GenaiClient is not None:
             try:
                 self._gemini_client = _GenaiClient(api_key=APIConfig.get_google_api_key())
@@ -323,60 +324,6 @@ class HtmlDocGenerator:
         # Keep the result concise and readable for screen readers.
         return ", ".join(desc_parts) if desc_parts else fallback_label
 
-    def _get_transcript_context_around_timestamp(
-        self,
-        transcript_data: Optional[Dict],
-        timestamp: float,
-        window_seconds: float = 60.0,
-    ) -> tuple[str, str]:
-        """
-        Collect brief transcript context before and after a diagram timestamp.
-        Returns (before_text, after_text).
-        """
-        if not transcript_data:
-            return ("", "")
-        segments = transcript_data.get("segments", []) or []
-        before_parts: List[str] = []
-        after_parts: List[str] = []
-        start_before = max(0.0, float(timestamp) - window_seconds)
-        end_after = float(timestamp) + window_seconds
-        for seg in segments:
-            seg_start = float(seg.get("start", 0.0) or 0.0)
-            seg_end = float(seg.get("end", 0.0) or 0.0)
-            text = (seg.get("text") or "").strip()
-            if not text:
-                continue
-            if seg_end >= start_before and seg_start <= float(timestamp):
-                before_parts.append(text)
-            if seg_start >= float(timestamp) and seg_start <= end_after:
-                after_parts.append(text)
-        before_text = " ".join(before_parts).strip()[:1200]
-        after_text = " ".join(after_parts).strip()[:1200]
-        return (before_text, after_text)
-
-    def _get_local_transcript_focus(
-        self,
-        transcript_data: Optional[Dict],
-        timestamp: float,
-        focus_window_seconds: float = 12.0,
-    ) -> str:
-        """Get tight transcript around diagram timestamp to avoid generic alt text."""
-        if not transcript_data:
-            return ""
-        segments = transcript_data.get("segments", []) or []
-        start = max(0.0, float(timestamp) - focus_window_seconds)
-        end = float(timestamp) + focus_window_seconds
-        parts: List[str] = []
-        for seg in segments:
-            seg_start = float(seg.get("start", 0.0) or 0.0)
-            seg_end = float(seg.get("end", 0.0) or 0.0)
-            if seg_end < start or seg_start > end:
-                continue
-            txt = (seg.get("text") or "").strip()
-            if txt:
-                parts.append(txt)
-        return " ".join(parts).strip()[:700]
-
     def _is_generic_alt_text(self, alt_text: str) -> bool:
         """Detect low-information generic captions and force a retry."""
         if not alt_text:
@@ -399,11 +346,10 @@ class HtmlDocGenerator:
         self,
         image_path: str,
         metadata: Optional[Dict],
-        transcript_data: Optional[Dict],
         fallback_label: str,
     ) -> str:
         """
-        Build descriptive alt text using Gemini (image + transcript context), with safe fallback.
+        Build descriptive alt text using Gemini from image only, with safe fallback.
         """
         # Stable cache key: prefer diagram_id; fallback to absolute path.
         cache_key = str(metadata.get("diagram_id")) if metadata and metadata.get("diagram_id") is not None else image_path
@@ -417,54 +363,58 @@ class HtmlDocGenerator:
 
         try:
             ts = float((metadata or {}).get("timestamp", 0.0) or 0.0)
-            before_text, after_text = self._get_transcript_context_around_timestamp(
-                transcript_data, ts, window_seconds=90.0
-            )
-            local_focus = self._get_local_transcript_focus(transcript_data, ts, focus_window_seconds=12.0)
             content_type = (metadata or {}).get("content_type", "")
             board_type = (metadata or {}).get("board_type", "")
             did = (metadata or {}).get("diagram_id", "unknown")
-            prompt = f"""Create a concise, accessibility-focused alt text for this lecture diagram image.
+            prompt = f"""Create a concise, accessibility-focused description of what this diagram explains.
 
 Constraints:
 - Output exactly one sentence, 14-28 words.
-- Explain the specific concept/process/relationship this exact diagram is conveying.
-- Do not invent facts not supported by the image or transcript context.
-- Avoid generic phrases like "a block diagram illustrates", "this diagram", or "the diagram shows".
-- Mention the specific topic/objects from context (e.g., signal x(t), feedback loop, force balance, pipeline steps).
+- Explain the specific concept/process/relationship visible in this diagram.
+- Do not invent facts not visible in the image.
+- Avoid generic starts like "A block diagram illustrates", "This diagram", or "The diagram shows".
+- Mention concrete elements visible in the diagram (e.g., labels, arrows, blocks, equations, axes, components).
 
 Metadata:
 - Diagram id: {did}
 - Content type: {content_type}
 - Board type: {board_type}
 - Timestamp: {format_timestamp(ts)}
-
-Tight local transcript near timestamp:
-{local_focus if local_focus else "None"}
-
-Transcript context before:
-{before_text if before_text else "None"}
-
-Transcript context after:
-{after_text if after_text else "None"}
 """
             img = Image.open(image_path)
             response = self._gemini_client.models.generate_content(
                 model=self._gemini_model_name,
                 contents=[prompt, img],
-                config={"temperature": 0.15, "max_output_tokens": 120},
+                config={"temperature": 0.1, "max_output_tokens": 120},
             )
             alt_text = (getattr(response, "text", None) or "").strip()
+            # Same extraction style robustness as diagram_enhancer: inspect parts if text is empty.
+            if not alt_text and getattr(response, "parts", None):
+                for part in response.parts:
+                    if getattr(part, "text", None):
+                        alt_text = part.text.strip()
+                        if alt_text:
+                            break
             alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
             # Retry once with stricter instruction if output is generic.
             if self._is_generic_alt_text(alt_text):
-                retry_prompt = prompt + "\n\nReturn one specific sentence only. Do NOT start with 'A block diagram illustrates'."
+                retry_prompt = (
+                    prompt
+                    + "\n\nReturn one specific sentence only. Start with the main topic directly, "
+                      "for example: 'Flow of ...', 'Signal path for ...', 'Architecture of ...'."
+                )
                 response = self._gemini_client.models.generate_content(
                     model=self._gemini_model_name,
                     contents=[retry_prompt, img],
                     config={"temperature": 0.05, "max_output_tokens": 120},
                 )
                 alt_text = (getattr(response, "text", None) or "").strip()
+                if not alt_text and getattr(response, "parts", None):
+                    for part in response.parts:
+                        if getattr(part, "text", None):
+                            alt_text = part.text.strip()
+                            if alt_text:
+                                break
                 alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
             if not alt_text:
                 alt_text = fallback_alt
@@ -536,7 +486,6 @@ Transcript context after:
                 alt_text = self._build_alt_text_with_ai(
                     diagram_to_insert["path"],
                     diagram_to_insert.get("metadata"),
-                    transcript_data,
                     fallback_label=f"Diagram at {cap_ts}",
                 )
                 if self._is_step3_dynamic_eligible(diagram_to_insert["metadata"]):
@@ -559,7 +508,6 @@ Transcript context after:
                 alt_text = self._build_alt_text_with_ai(
                     di["path"],
                     di.get("metadata"),
-                    transcript_data,
                     fallback_label=f"Diagram at {cap_ts}",
                 )
                 if self._is_step3_dynamic_eligible(di["metadata"]):
@@ -659,7 +607,6 @@ Transcript context after:
                         alt_text = self._build_alt_text_with_ai(
                             os.path.join(output_dir, path),
                             entry.get("metadata"),
-                            transcript_data,
                             fallback_label=f"Diagram {n}",
                         )
                         if self._is_step3_dynamic_eligible(entry.get("metadata")):
