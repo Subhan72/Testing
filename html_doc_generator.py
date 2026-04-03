@@ -11,6 +11,12 @@ import html as html_lib
 import config
 import cv2
 import numpy as np
+from PIL import Image
+from api_config import APIConfig
+try:
+    from google.genai import Client as _GenaiClient
+except Exception:
+    _GenaiClient = None
 
 # Relative path from output_dir to enhanced images folder (same directory level as HTML files)
 ENHANCED_IMAGES_SUBDIR = "enhanced_diagrams"
@@ -148,6 +154,14 @@ class HtmlDocGenerator:
 
     def __init__(self):
         self.enhanced_subdir = ENHANCED_IMAGES_SUBDIR
+        self._ai_alt_cache: Dict[str, str] = {}
+        self._gemini_client = None
+        self._gemini_model_name = "gemini-3-pro-preview"
+        if _GenaiClient is not None:
+            try:
+                self._gemini_client = _GenaiClient(api_key=APIConfig.get_google_api_key())
+            except Exception:
+                self._gemini_client = None
 
     def _estimate_visual_scale(self, image_path: str) -> float:
         """
@@ -273,6 +287,138 @@ class HtmlDocGenerator:
         except ValueError:
             return os.path.basename(absolute_path)
 
+    def _build_image_alt_text(self, metadata: Optional[Dict], fallback_label: str = "diagram") -> str:
+        """
+        Build accessible, descriptive alt text from diagram metadata.
+        """
+        if not metadata:
+            return fallback_label
+
+        did = metadata.get("diagram_id")
+        ts = metadata.get("timestamp")
+        board_type = metadata.get("board_type")
+        content_type = metadata.get("content_type")
+
+        desc_parts = []
+        desc_parts.append("lecture diagram")
+
+        if content_type:
+            if str(content_type).lower() == "digital":
+                desc_parts.append("digital")
+            elif str(content_type).lower() == "hand_drawn":
+                desc_parts.append("hand-drawn")
+
+        if board_type and str(board_type).lower() != "unknown":
+            desc_parts.append(f"from {board_type}")
+
+        if did is not None:
+            desc_parts.append(f"id {did}")
+
+        if ts is not None:
+            try:
+                desc_parts.append(f"at {format_timestamp(float(ts))}")
+            except Exception:
+                pass
+
+        # Keep the result concise and readable for screen readers.
+        return ", ".join(desc_parts) if desc_parts else fallback_label
+
+    def _get_transcript_context_around_timestamp(
+        self,
+        transcript_data: Optional[Dict],
+        timestamp: float,
+        window_seconds: float = 60.0,
+    ) -> tuple[str, str]:
+        """
+        Collect brief transcript context before and after a diagram timestamp.
+        Returns (before_text, after_text).
+        """
+        if not transcript_data:
+            return ("", "")
+        segments = transcript_data.get("segments", []) or []
+        before_parts: List[str] = []
+        after_parts: List[str] = []
+        start_before = max(0.0, float(timestamp) - window_seconds)
+        end_after = float(timestamp) + window_seconds
+        for seg in segments:
+            seg_start = float(seg.get("start", 0.0) or 0.0)
+            seg_end = float(seg.get("end", 0.0) or 0.0)
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            if seg_end >= start_before and seg_start <= float(timestamp):
+                before_parts.append(text)
+            if seg_start >= float(timestamp) and seg_start <= end_after:
+                after_parts.append(text)
+        before_text = " ".join(before_parts).strip()[:1200]
+        after_text = " ".join(after_parts).strip()[:1200]
+        return (before_text, after_text)
+
+    def _build_alt_text_with_ai(
+        self,
+        image_path: str,
+        metadata: Optional[Dict],
+        transcript_data: Optional[Dict],
+        fallback_label: str,
+    ) -> str:
+        """
+        Build descriptive alt text using Gemini (image + transcript context), with safe fallback.
+        """
+        # Stable cache key: prefer diagram_id; fallback to absolute path.
+        cache_key = str(metadata.get("diagram_id")) if metadata and metadata.get("diagram_id") is not None else image_path
+        if cache_key in self._ai_alt_cache:
+            return self._ai_alt_cache[cache_key]
+
+        fallback_alt = self._build_image_alt_text(metadata, fallback_label=fallback_label)
+        if self._gemini_client is None or not os.path.exists(image_path):
+            self._ai_alt_cache[cache_key] = fallback_alt
+            return fallback_alt
+
+        try:
+            ts = float((metadata or {}).get("timestamp", 0.0) or 0.0)
+            before_text, after_text = self._get_transcript_context_around_timestamp(
+                transcript_data, ts, window_seconds=60.0
+            )
+            content_type = (metadata or {}).get("content_type", "")
+            board_type = (metadata or {}).get("board_type", "")
+            prompt = f"""Create a concise, accessibility-focused alt text for this lecture diagram image.
+
+Constraints:
+- Output only one sentence, maximum 28 words.
+- Explain what the diagram is conveying (concept/process/relationship), not pixel-level details.
+- Do not invent facts not supported by the image or transcript context.
+- Avoid generic phrases like "image of".
+
+Metadata:
+- Content type: {content_type}
+- Board type: {board_type}
+- Timestamp: {format_timestamp(ts)}
+
+Transcript context before:
+{before_text if before_text else "None"}
+
+Transcript context after:
+{after_text if after_text else "None"}
+"""
+            img = Image.open(image_path)
+            response = self._gemini_client.models.generate_content(
+                model=self._gemini_model_name,
+                contents=[prompt, img],
+                config={"temperature": 0.2, "max_output_tokens": 100},
+            )
+            alt_text = (getattr(response, "text", None) or "").strip()
+            alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
+            if not alt_text:
+                alt_text = fallback_alt
+            # Hard cap for safety/readability in alt attributes.
+            if len(alt_text) > 220:
+                alt_text = alt_text[:217].rstrip() + "..."
+            self._ai_alt_cache[cache_key] = alt_text
+            return alt_text
+        except Exception:
+            self._ai_alt_cache[cache_key] = fallback_alt
+            return fallback_alt
+
     def generate_transcript_html(
         self,
         output_path: str,
@@ -326,6 +472,12 @@ class HtmlDocGenerator:
             if diagram_to_insert:
                 rel_path = self._relative_image_path(diagram_to_insert["path"], output_dir)
                 cap_ts = format_timestamp(diagram_to_insert["metadata"].get("timestamp", 0))
+                alt_text = self._build_alt_text_with_ai(
+                    diagram_to_insert["path"],
+                    diagram_to_insert.get("metadata"),
+                    transcript_data,
+                    fallback_label=f"Diagram at {cap_ts}",
+                )
                 if self._is_step3_dynamic_eligible(diagram_to_insert["metadata"]):
                     html_w, _ = self._dynamic_image_widths(diagram_to_insert["path"])
                 else:
@@ -333,7 +485,7 @@ class HtmlDocGenerator:
                 parts.append(
                     f"<figure><img src=\"{html_lib.escape(rel_path)}\" "
                     f"style=\"max-width: {html_w}%; height: auto;\" "
-                    f"alt=\"Diagram at {cap_ts}\"/><figcaption>Diagram at {cap_ts}</figcaption></figure>"
+                    f"alt=\"{html_lib.escape(alt_text)}\"/><figcaption>Diagram at {cap_ts}</figcaption></figure>"
                 )
 
             parts.append("</section>")
@@ -343,6 +495,12 @@ class HtmlDocGenerator:
             for di in diagrams:
                 rel_path = self._relative_image_path(di["path"], output_dir)
                 cap_ts = format_timestamp(di["metadata"].get("timestamp", 0))
+                alt_text = self._build_alt_text_with_ai(
+                    di["path"],
+                    di.get("metadata"),
+                    transcript_data,
+                    fallback_label=f"Diagram at {cap_ts}",
+                )
                 if self._is_step3_dynamic_eligible(di["metadata"]):
                     html_w, _ = self._dynamic_image_widths(di["path"])
                 else:
@@ -352,7 +510,7 @@ class HtmlDocGenerator:
                 parts.append(
                     f"<figure><img src=\"{html_lib.escape(rel_path)}\" "
                     f"style=\"max-width: {html_w}%; height: auto;\" "
-                    f"alt=\"Diagram at {cap_ts}\"/><figcaption>Diagram at {cap_ts}</figcaption></figure>"
+                    f"alt=\"{html_lib.escape(alt_text)}\"/><figcaption>Diagram at {cap_ts}</figcaption></figure>"
                 )
                 parts.append("</section>")
 
@@ -371,6 +529,7 @@ class HtmlDocGenerator:
         diagram_metadata: List[Dict],
         enhanced_diagram_paths: Dict[int, str],
         output_dir: str,
+        transcript_data: Optional[Dict] = None,
     ) -> tuple:
         """
         Parse explanation text (## / ### and [DIAGRAM:N]), produce (html_body_string, toc_entries).
@@ -436,6 +595,12 @@ class HtmlDocGenerator:
                     entry = diagram_index_to_entry.get(n)
                     if entry:
                         path = entry["path"]
+                        alt_text = self._build_alt_text_with_ai(
+                            os.path.join(output_dir, path),
+                            entry.get("metadata"),
+                            transcript_data,
+                            fallback_label=f"Diagram {n}",
+                        )
                         if self._is_step3_dynamic_eligible(entry.get("metadata")):
                             html_w, _ = self._dynamic_image_widths(os.path.join(output_dir, path))
                         else:
@@ -443,7 +608,7 @@ class HtmlDocGenerator:
                         out.append(
                             f"<figure><img src=\"{html_lib.escape(path)}\" "
                             f"style=\"max-width: {html_w}%; height: auto;\" "
-                            f"alt=\"Diagram {n}\"/><figcaption>Figure {n}</figcaption></figure>"
+                            f"alt=\"{html_lib.escape(alt_text)}\"/><figcaption>Figure {n}</figcaption></figure>"
                         )
                     else:
                         out.append(f"<!-- Diagram {n} (image not found) -->")
@@ -471,12 +636,13 @@ class HtmlDocGenerator:
         enhanced_diagram_paths: Dict[int, str],
         video_name: Optional[str] = None,
         output_dir: Optional[str] = None,
+        transcript_data: Optional[Dict] = None,
     ) -> str:
         """Generate explanation HTML with TOC and heading tags (RAG-friendly)."""
         output_dir = output_dir or os.path.dirname(output_path)
         title = (video_name or "Lecture") + " — Detailed Explanation"
         body_html, toc_entries = self._explanation_to_html_with_toc(
-            explanation_text, diagram_metadata, enhanced_diagram_paths, output_dir
+            explanation_text, diagram_metadata, enhanced_diagram_paths, output_dir, transcript_data=transcript_data
         )
 
         toc_lines = ["<nav class=\"toc\" aria-label=\"Table of contents\">", "<h2>Table of Contents</h2>", "<ul>"]
