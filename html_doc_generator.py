@@ -15,10 +15,8 @@ from PIL import Image
 from api_config import APIConfig
 try:
     from google.genai import Client as _GenaiClient
-    from google.genai import types as _GenaiTypes
 except Exception:
     _GenaiClient = None
-    _GenaiTypes = None
 
 # Relative path from output_dir to enhanced images folder (same directory level as HTML files)
 ENHANCED_IMAGES_SUBDIR = "enhanced_diagrams"
@@ -158,10 +156,8 @@ class HtmlDocGenerator:
         self.enhanced_subdir = ENHANCED_IMAGES_SUBDIR
         self._ai_alt_cache: Dict[str, str] = {}
         self._gemini_client = None
-        # Keep model aligned with diagram_enhancer.py for image understanding tasks.
-        self._gemini_model_name = "gemini-3-pro-image-preview"
-        # Backup text-capable multimodal model when image-preview returns empty text.
-        self._gemini_fallback_model_name = "gemini-3-pro-preview"
+        # Use same text-generation style/model family as summary_generator.py
+        self._gemini_model_name = "gemini-3-pro-preview"
         if _GenaiClient is not None:
             try:
                 self._gemini_client = _GenaiClient(api_key=APIConfig.get_google_api_key())
@@ -355,8 +351,14 @@ class HtmlDocGenerator:
         """
         Build descriptive alt text using Gemini from image only, with safe fallback.
         """
-        # Stable cache key: prefer diagram_id; fallback to absolute path.
-        cache_key = str(metadata.get("diagram_id")) if metadata and metadata.get("diagram_id") is not None else image_path
+        # Cache key includes file mtime to avoid stale fallback reuse across regenerated diagrams.
+        img_mtime = 0
+        try:
+            img_mtime = int(os.path.getmtime(image_path))
+        except Exception:
+            pass
+        base_key = str(metadata.get("diagram_id")) if metadata and metadata.get("diagram_id") is not None else image_path
+        cache_key = f"{base_key}:{img_mtime}"
         if cache_key in self._ai_alt_cache:
             return self._ai_alt_cache[cache_key]
 
@@ -386,41 +388,25 @@ Metadata:
 - Timestamp: {format_timestamp(ts)}
 """
             img = Image.open(image_path)
+            # Match summary_generator.py API usage pattern for reliable text outputs.
             response = self._gemini_client.models.generate_content(
                 model=self._gemini_model_name,
                 contents=[prompt, img],
-                config=(
-                    _GenaiTypes.GenerateContentConfig(
-                        response_modalities=["TEXT"],
-                        temperature=0.1,
-                        max_output_tokens=120,
-                    )
-                    if _GenaiTypes is not None
-                    else {"temperature": 0.1, "max_output_tokens": 120}
-                ),
+                config={
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 140,
+                },
             )
             alt_text = (getattr(response, "text", None) or "").strip()
-            # Same extraction style robustness as diagram_enhancer: inspect parts if text is empty.
+            # Fallback parsing if text is not directly present.
             if not alt_text and getattr(response, "parts", None):
                 for part in response.parts:
                     if getattr(part, "text", None):
                         alt_text = part.text.strip()
                         if alt_text:
                             break
-            # Backup call when image-preview returns no text in some environments.
-            if not alt_text:
-                response = self._gemini_client.models.generate_content(
-                    model=self._gemini_fallback_model_name,
-                    contents=[prompt, img],
-                    config={"temperature": 0.1, "max_output_tokens": 120},
-                )
-                alt_text = (getattr(response, "text", None) or "").strip()
-                if not alt_text and getattr(response, "parts", None):
-                    for part in response.parts:
-                        if getattr(part, "text", None):
-                            alt_text = part.text.strip()
-                            if alt_text:
-                                break
             alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
             # Retry once with stricter instruction if output is generic.
             if self._is_generic_alt_text(alt_text):
@@ -432,15 +418,12 @@ Metadata:
                 response = self._gemini_client.models.generate_content(
                     model=self._gemini_model_name,
                     contents=[retry_prompt, img],
-                    config=(
-                        _GenaiTypes.GenerateContentConfig(
-                            response_modalities=["TEXT"],
-                            temperature=0.05,
-                            max_output_tokens=120,
-                        )
-                        if _GenaiTypes is not None
-                        else {"temperature": 0.05, "max_output_tokens": 120}
-                    ),
+                    config={
+                        "temperature": 0.05,
+                        "top_p": 0.9,
+                        "top_k": 40,
+                        "max_output_tokens": 140,
+                    },
                 )
                 alt_text = (getattr(response, "text", None) or "").strip()
                 if not alt_text and getattr(response, "parts", None):
@@ -449,19 +432,6 @@ Metadata:
                             alt_text = part.text.strip()
                             if alt_text:
                                 break
-                if not alt_text:
-                    response = self._gemini_client.models.generate_content(
-                        model=self._gemini_fallback_model_name,
-                        contents=[retry_prompt, img],
-                        config={"temperature": 0.05, "max_output_tokens": 120},
-                    )
-                    alt_text = (getattr(response, "text", None) or "").strip()
-                    if not alt_text and getattr(response, "parts", None):
-                        for part in response.parts:
-                            if getattr(part, "text", None):
-                                alt_text = part.text.strip()
-                                if alt_text:
-                                    break
                 alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
             if not alt_text:
                 alt_text = fallback_alt
