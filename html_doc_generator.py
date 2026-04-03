@@ -354,6 +354,47 @@ class HtmlDocGenerator:
         after_text = " ".join(after_parts).strip()[:1200]
         return (before_text, after_text)
 
+    def _get_local_transcript_focus(
+        self,
+        transcript_data: Optional[Dict],
+        timestamp: float,
+        focus_window_seconds: float = 12.0,
+    ) -> str:
+        """Get tight transcript around diagram timestamp to avoid generic alt text."""
+        if not transcript_data:
+            return ""
+        segments = transcript_data.get("segments", []) or []
+        start = max(0.0, float(timestamp) - focus_window_seconds)
+        end = float(timestamp) + focus_window_seconds
+        parts: List[str] = []
+        for seg in segments:
+            seg_start = float(seg.get("start", 0.0) or 0.0)
+            seg_end = float(seg.get("end", 0.0) or 0.0)
+            if seg_end < start or seg_start > end:
+                continue
+            txt = (seg.get("text") or "").strip()
+            if txt:
+                parts.append(txt)
+        return " ".join(parts).strip()[:700]
+
+    def _is_generic_alt_text(self, alt_text: str) -> bool:
+        """Detect low-information generic captions and force a retry."""
+        if not alt_text:
+            return True
+        s = alt_text.strip().lower()
+        generic_starts = (
+            "a block diagram",
+            "this diagram",
+            "the diagram shows",
+            "a diagram illustrates",
+            "an image of",
+        )
+        if any(s.startswith(p) for p in generic_starts):
+            return True
+        if len(s.split()) < 6:
+            return True
+        return False
+
     def _build_alt_text_with_ai(
         self,
         image_path: str,
@@ -377,22 +418,29 @@ class HtmlDocGenerator:
         try:
             ts = float((metadata or {}).get("timestamp", 0.0) or 0.0)
             before_text, after_text = self._get_transcript_context_around_timestamp(
-                transcript_data, ts, window_seconds=60.0
+                transcript_data, ts, window_seconds=90.0
             )
+            local_focus = self._get_local_transcript_focus(transcript_data, ts, focus_window_seconds=12.0)
             content_type = (metadata or {}).get("content_type", "")
             board_type = (metadata or {}).get("board_type", "")
+            did = (metadata or {}).get("diagram_id", "unknown")
             prompt = f"""Create a concise, accessibility-focused alt text for this lecture diagram image.
 
 Constraints:
-- Output only one sentence, maximum 28 words.
-- Explain what the diagram is conveying (concept/process/relationship), not pixel-level details.
+- Output exactly one sentence, 14-28 words.
+- Explain the specific concept/process/relationship this exact diagram is conveying.
 - Do not invent facts not supported by the image or transcript context.
-- Avoid generic phrases like "image of".
+- Avoid generic phrases like "a block diagram illustrates", "this diagram", or "the diagram shows".
+- Mention the specific topic/objects from context (e.g., signal x(t), feedback loop, force balance, pipeline steps).
 
 Metadata:
+- Diagram id: {did}
 - Content type: {content_type}
 - Board type: {board_type}
 - Timestamp: {format_timestamp(ts)}
+
+Tight local transcript near timestamp:
+{local_focus if local_focus else "None"}
 
 Transcript context before:
 {before_text if before_text else "None"}
@@ -404,11 +452,24 @@ Transcript context after:
             response = self._gemini_client.models.generate_content(
                 model=self._gemini_model_name,
                 contents=[prompt, img],
-                config={"temperature": 0.2, "max_output_tokens": 100},
+                config={"temperature": 0.15, "max_output_tokens": 120},
             )
             alt_text = (getattr(response, "text", None) or "").strip()
             alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
+            # Retry once with stricter instruction if output is generic.
+            if self._is_generic_alt_text(alt_text):
+                retry_prompt = prompt + "\n\nReturn one specific sentence only. Do NOT start with 'A block diagram illustrates'."
+                response = self._gemini_client.models.generate_content(
+                    model=self._gemini_model_name,
+                    contents=[retry_prompt, img],
+                    config={"temperature": 0.05, "max_output_tokens": 120},
+                )
+                alt_text = (getattr(response, "text", None) or "").strip()
+                alt_text = re.sub(r"\s+", " ", alt_text).strip().strip('"')
             if not alt_text:
+                alt_text = fallback_alt
+            if self._is_generic_alt_text(alt_text):
+                # Final fallback to non-generic metadata-derived description.
                 alt_text = fallback_alt
             # Hard cap for safety/readability in alt attributes.
             if len(alt_text) > 220:
